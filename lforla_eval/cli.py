@@ -220,20 +220,13 @@ def push(
         "benchmark_id": bid,
         "model_id": model_id or data.get("model_id", ""),
         "overall_score": round(avg_score, 2),
-        "result_type": "generic",
         "metrics": {
             "avg_latency_ms": round(avg_latency, 2),
             "total_tokens": total_tokens,
             "sample_count": len(scores),
         },
-        "raw_outputs": {s["sample_id"]: s.get("output", "") for s in scores if "sample_id" in s},
         "visibility": visibility,
     }
-
-    if data.get("model"):
-        payload["model_name"] = data["model"]
-    if data.get("provider"):
-        payload["provider"] = data["provider"]
 
     resp = client.post("/evaluations", payload)
     eval_id = resp.get("id", resp.get("evaluation_id", "unknown"))
