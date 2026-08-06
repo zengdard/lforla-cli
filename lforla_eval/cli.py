@@ -113,6 +113,99 @@ def pull(
 
 
 @app.command()
+def bench_push(
+    file: str = typer.Argument(..., help="Benchmark YAML file (.lforla-benchmark.yaml)"),
+    moderator: bool = typer.Option(False, "--moderator", help="Verify moderator/admin role before pushing"),
+):
+    """Push a benchmark definition to LFORLA (moderator-only)."""
+    path = Path(file)
+    if not path.exists():
+        rprint(f"[red]Error:[/red] File not found: {file}")
+        raise typer.Exit(1)
+
+    raw = path.read_text()
+    data = yaml.safe_load(raw)
+
+    required = ["name", "slug", "description", "taskType", "categories", "maxScore"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        rprint(f"[red]Error:[/red] Missing required fields: {', '.join(missing)}")
+        raise typer.Exit(1)
+
+    if moderator:
+        try:
+            me = client.get("/auth/me") or {}
+            user = me.get("user") or {}
+            role = user.get("role", "")
+            is_admin = user.get("is_super_admin", False) or role == "admin"
+            if not is_admin:
+                rprint("[red]Error:[/red] --moderator flag requires admin/moderator role")
+                rprint(f"  Your role: {role}")
+                raise typer.Exit(1)
+            rprint(f"[green]✓[/green] Moderator check passed (role: {role})")
+        except Exception as e:
+            rprint(f"[red]Error:[/red] Cannot verify role: {e}")
+            rprint("  Make sure you are logged in as a moderator/admin")
+            raise typer.Exit(1)
+
+    payload = {
+        "name": data["name"],
+        "slug": data["slug"],
+        "shortDescription": data.get("shortDescription", data.get("short_description", data["description"][:120])),
+        "description": data["description"],
+        "visibility": data.get("visibility", "public"),
+        "modelType": "llm",
+        "taskTypeId": None,
+        "source": data.get("source"),
+        "license": data.get("license"),
+        "language": data.get("language", "en-US"),
+        "pricingTier": data.get("pricingTier", "free"),
+        "categories": data.get("categories", []),
+        "maxScore": data["maxScore"],
+        "resultSchema": data.get("resultSchema", {}),
+        "defaultConfig": data.get("evaluation", {}),
+        "tagIds": [],
+        "datasetIds": [],
+    }
+
+    paper = data.get("paper", {})
+    if paper:
+        payload["paperTitle"] = paper.get("title")
+        payload["paperAuthors"] = paper.get("authors")
+        if paper.get("date"):
+            payload["paperDate"] = paper["date"]
+
+    rprint(f"\n[bold]Pushing benchmark:[/bold] {data['name']} ({data['slug']})")
+    rprint(f"  Task type: {data['taskType']}")
+    rprint(f"  Categories: {', '.join(data.get('categories', []))}")
+
+    try:
+        result = client.post("/benchmarks", payload)
+        bid = result.get("id", "?")
+        rprint(f"\n[green]✓[/green] Benchmark created: {bid}")
+        rprint(f"  View at: {client.api_url}/benchmarks/{data['slug']}")
+
+        files = data.get("files", [])
+        if files:
+            rprint(f"\n[bold]Files to upload:[/bold] {len(files)} file(s)")
+            for f in files:
+                src = f.get("source", f.get("path", ""))
+                rprint(f"  • {f.get('path', src)} ({f.get('description', '')})")
+            rprint("\n[yellow]Use 'lforla-eval dataset upload' to upload files[/yellow]")
+
+        rprint("\n[yellow]── After pushing all changes ──[/yellow]")
+        rprint("  To rebuild the frontend on the server:")
+        rprint("    ssh hetzner_fips 'cd /home/jeremy/sites/lforla && docker compose \\")
+        rprint("      -f docker-compose.yml -f docker-compose.vps.yml build --no-cache nginx \\")
+        rprint("      && docker compose up -d --force-recreate nginx'")
+        rprint("")
+
+    except Exception as e:
+        rprint(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
 def run(
     input_file: str = typer.Argument(
         ..., help="Samples file (JSON/YAML array of samples with 'input_data' field)"
@@ -176,6 +269,223 @@ def run(
     out_path.write_text(json.dumps(output_data, indent=2))
     successes = sum(1 for r in results if "error" not in r)
     rprint(f"\n[green]✓[/green] {successes}/{total} samples completed → {out_path}")
+
+
+@app.command()
+def dataset_upload(
+    file: str = typer.Argument(..., help="Local file path to upload"),
+    dataset_slug: str = typer.Argument(..., help="Dataset slug on LFORLA"),
+    name: str = typer.Option(None, "--name", help="Dataset name (created if not exists)"),
+    description: str = typer.Option(None, "--description", help="Dataset description"),
+    version: str = typer.Option("1.0", "--version", help="Dataset version"),
+    benchmark_slug: str = typer.Option(None, "--benchmark", "-b", help="Link to benchmark after upload"),
+):
+    """Upload a file to MinIO and create a dataset version."""
+    path = Path(file)
+    if not path.exists():
+        rprint(f"[red]Error:[/red] File not found: {file}")
+        raise typer.Exit(1)
+
+    file_size = path.stat().st_size
+    rprint(f"Uploading {path.name} ({file_size / 1024 / 1024:.1f} MB)")
+
+    # 1. Find or create dataset
+    dataset = None
+    try:
+        dataset = client.get(f"/datasets/{dataset_slug}")
+        rprint(f"[green]✓[/green] Dataset found: {dataset['id']}")
+    except Exception:
+        if not name:
+            rprint("[red]Error:[/red] Dataset not found. Use --name to create it.")
+            raise typer.Exit(1)
+        dataset = client.post("/datasets", {
+            "name": name,
+            "slug": dataset_slug,
+            "description": description or "",
+        })
+        rprint(f"[green]✓[/green] Dataset created: {dataset['id']}")
+
+    # 2. Generate presigned upload URL
+    file_key = None
+    upload_url = None
+    try:
+        upload_info = client.post(
+            f"/datasets/{dataset['id']}/presign-upload", {"fileName": path.name}
+        ) or {}
+        upload_url = upload_info.get("uploadUrl", "")
+        file_key = upload_info.get("fileKey")
+    except Exception as e:
+        rprint(f"[yellow]⚠[/yellow] presign-upload failed: {e}")
+
+    if not upload_url:
+        rprint(
+            "[red]✗[/red] No presigned upload URL — file was NOT uploaded. "
+            "Aborting (no version created)."
+        )
+        rprint("  Check that you own the dataset (403 = forbidden) and that the API is reachable.")
+        raise typer.Exit(1)
+
+    rprint("  Uploading to MinIO...")
+    import httpx
+    with open(path, "rb") as f:
+        resp = httpx.put(upload_url, content=f.read())
+        resp.raise_for_status()
+    rprint(f"[green]✓[/green] File uploaded to MinIO")
+
+    # 3. Create dataset version
+    import datetime
+    sample_count = 0
+    try:
+        sample_count = sum(1 for _ in path.open(encoding="utf-8", errors="ignore"))
+    except OSError:
+        pass
+    version_data = {
+        "version": version,
+        "description": description or f"Upload of {path.name}",
+        "releaseDate": datetime.date.today().isoformat(),
+        "fileKey": file_key,
+    }
+    if sample_count:
+        version_data["sampleCount"] = sample_count
+    ds_version = client.post(f"/datasets/{dataset['id']}/versions", version_data)
+    rprint(f"[green]✓[/green] Version created: {ds_version.get('id', '?')}")
+
+    # 4. Link to benchmark
+    if benchmark_slug:
+        link = client.post(f"/benchmarks/{benchmark_slug}/datasets", {
+            "datasetId": dataset["id"],
+            "version": version,
+        })
+        rprint(f"[green]✓[/green] Linked to benchmark: {benchmark_slug}")
+
+    rprint(f"\n[green]✓[/green] Dataset ready: {dataset_slug} (version {version})")
+
+
+@app.command()
+def report(
+    results_file: str = typer.Argument(..., help="Results JSON from 'run' command"),
+    output: str = typer.Option("report.md", "--output", "-o", help="Output report file (.md or .html)"),
+    benchmark_slug: Optional[str] = typer.Option(
+        None, "--benchmark", "-b", help="Benchmark slug (fetches metadata for context)"
+    ),
+):
+    """Generate an evaluation report (markdown or HTML) from results."""
+    path = Path(results_file)
+    if not path.exists():
+        rprint(f"[red]Error:[/red] File not found: {results_file}")
+        raise typer.Exit(1)
+
+    data = json.loads(path.read_text())
+    results = data.get("results", [data])
+    if isinstance(results, dict):
+        results = [results]
+
+    successes = [r for r in results if "error" not in r]
+    failures = [r for r in results if "error" in r]
+
+    meta = None
+    if benchmark_slug:
+        try:
+            meta = client.get(f"/benchmarks/{benchmark_slug}")
+        except Exception:
+            meta = None
+
+    scores = [_extract_score(s) for s in successes]
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    total_tokens = sum(s.get("tokens_input", 0) + s.get("tokens_output", 0) for s in successes)
+    total_ms = sum(s.get("execution_time_ms", 0) for s in successes)
+    avg_latency = total_ms / len(successes) if successes else 0.0
+
+    title = meta.get("name", "Evaluation report") if meta else "Evaluation report"
+    slug = (meta.get("slug") or benchmark_slug) if meta else benchmark_slug
+
+    lines = [
+        f"# {title}",
+        "",
+        f"- **Benchmark**: `{slug or 'unknown'}`"
+        f"  · **Model**: `{data.get('model', 'unknown')}`"
+        f"  · **Provider**: `{data.get('provider', 'unknown')}`",
+        f"- **Samples**: {len(successes)}/{data.get('total_samples', len(results))} succeeded"
+        f"  · **Failures**: {len(failures)}",
+        f"- **Average score**: **{avg_score:.2f}**"
+        f"  · **Avg latency**: {avg_latency:.0f} ms"
+        f"  · **Total tokens**: {total_tokens}",
+        "",
+        "## Per-sample results",
+        "",
+        "| # | Sample | Score | Latency (ms) | Tokens |",
+        "|---|--------|-------|--------------|--------|",
+    ]
+
+    for i, s in enumerate(successes, 1):
+        sid = s.get("sample_id", str(i))
+        lines.append(
+            f"| {i} | {sid} | {_extract_score(s)} | "
+            f"{s.get('execution_time_ms', 0)} | "
+            f"{s.get('tokens_input', 0) + s.get('tokens_output', 0)} |"
+        )
+    if not successes:
+        lines.append("| — | — | — | — | — |")
+
+    if failures:
+        lines.append("")
+        lines.append("## Failures")
+        lines.append("")
+        for f in failures:
+            lines.append(f"- **{f.get('sample_id', '?')}**: {f.get('error', 'unknown error')}")
+
+    if meta and (meta.get("resultSchema") or meta.get("result_schema")):
+        result_schema = meta.get("resultSchema") or meta.get("result_schema")
+        lines.append("")
+        lines.append("## Result schema")
+        lines.append("")
+        lines.append("| Metric | Type | Min | Max | Higher is better |")
+        lines.append("|--------|------|-----|-----|------------------|")
+        for name, spec in result_schema.items():
+            lines.append(
+                f"| {name} | {spec.get('type', '')} | {spec.get('min', '')} | "
+                f"{spec.get('max', '')} | {spec.get('higher_is_better', '')} |"
+            )
+
+    body = "\n".join(lines) + "\n"
+    out_path = Path(output)
+    if out_path.suffix.lower() == ".html":
+        body = _to_html(title, body)
+    out_path.write_text(body)
+    rprint(f"[green]✓[/green] Report written → {out_path}")
+
+
+def _to_html(title: str, markdown_body: str) -> str:
+    import html as _html
+
+    escaped = _html.escape(markdown_body)
+    rows = []
+    for line in escaped.splitlines():
+        if line.startswith("# "):
+            rows.append(f"<h1>{line[2:]}</h1>")
+        elif line.startswith("## "):
+            rows.append(f"<h2>{line[3:]}</h2>")
+        elif line.startswith("| ") and "---" not in line:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+        elif line.startswith("|") and "---" in line:
+            continue
+        elif line.startswith("- "):
+            rows.append(f"<li>{line[2:]}</li>")
+        elif line == "":
+            rows.append("</table>" if rows and rows[-1].startswith("<tr>") else "<br>")
+        else:
+            rows.append(f"<p>{line}</p>")
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{_html.escape(title)}</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:900px;margin:40px auto;"
+        "padding:0 20px;color:#1f2937}h1{border-bottom:2px solid #e5e7eb;padding-bottom:8px}"
+        "table{border-collapse:collapse;width:100%;margin:12px 0}"
+        "td,th{border:1px solid #e5e7eb;padding:6px 10px;text-align:left}"
+        "tr:nth-child(even){background:#f9fafb}li{margin:4px 0}</style></head>"
+        f"<body>{''.join(rows)}</body></html>\n"
+    )
 
 
 @app.command()
