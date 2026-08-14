@@ -155,25 +155,21 @@ def bench_push(
         "description": data["description"],
         "visibility": data.get("visibility", "public"),
         "modelType": "llm",
-        "taskTypeId": None,
         "source": data.get("source"),
         "license": data.get("license"),
         "language": data.get("language", "en-US"),
         "pricingTier": data.get("pricingTier", "free"),
-        "categories": data.get("categories", []),
-        "maxScore": data["maxScore"],
         "resultSchema": data.get("resultSchema", {}),
         "defaultConfig": data.get("evaluation", {}),
+        "themeConfig": data.get("themeConfig", {}),
         "tagIds": [],
         "datasetIds": [],
     }
 
-    paper = data.get("paper", {})
-    if paper:
-        payload["paperTitle"] = paper.get("title")
-        payload["paperAuthors"] = paper.get("authors")
-        if paper.get("date"):
-            payload["paperDate"] = paper["date"]
+    # taskTypeId must be a valid UUID or omitted — the backend rejects null
+    task_type_id = data.get("taskTypeId")
+    if isinstance(task_type_id, str) and task_type_id:
+        payload["taskTypeId"] = task_type_id
 
     rprint(f"\n[bold]Pushing benchmark:[/bold] {data['name']} ({data['slug']})")
     rprint(f"  Task type: {data['taskType']}")
