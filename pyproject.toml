@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "lforla-eval"
-version = "0.2.0"
+name = "pyforla"
+version = "0.3.0"
 description = "CLI client for LFORLA — run benchmarks locally and push results to lforla.org"
 authors = [
   { name = "LFORLA" },

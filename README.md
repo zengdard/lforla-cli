@@ -1,4 +1,4 @@
-# lforla-eval
+# pyforla
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](pyproject.toml)
@@ -18,7 +18,7 @@ results to the leaderboard. Pairs with the [LFORLA platform](https://lforla.org/
 ## Install
 
 ```bash
-pip install git+https://github.com/lforla/pyforla.git
+pip install pyforla
 ```
 
 Or from source:
