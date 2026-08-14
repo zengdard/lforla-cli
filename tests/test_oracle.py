@@ -104,3 +104,28 @@ def test_parse_final_team():
     assert parse_final_team('[{"id": "c01"}]') == ["c01"]
     assert parse_final_team("```json\n{\"team\": [{\"id\": \"c01\"}]}\n```") == ["c01"]
     assert parse_final_team("no json here") is None
+
+
+# --- Cost pipeline ---
+from lforla_eval.model_runner import ModelRunner
+
+
+def test_cost_estimate_known_model():
+    r = ModelRunner("gpt-4o", "mock")
+    assert abs(r.estimate_cost_usd(5000, 2000) - 0.0325) < 1e-6
+
+
+def test_cost_estimate_unknown_model_none():
+    r = ModelRunner("bigmodel-x", "mock")
+    assert r.estimate_cost_usd(5000, 2000) is None
+
+
+def test_cost_estimate_env_override(monkeypatch):
+    monkeypatch.setenv("LFORLA_PRICE_PER_1K_IN", "1.0")
+    monkeypatch.setenv("LFORLA_PRICE_PER_1K_OUT", "2.0")
+    from importlib import reload
+    from lforla_eval import model_runner
+    reload(model_runner)
+    r = model_runner.ModelRunner("anything", "mock")
+    assert model_runner.PRICING.get("*") == (1.0, 2.0)
+    assert r.estimate_cost_usd(1000, 1000) == 3.0

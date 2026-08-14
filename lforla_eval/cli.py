@@ -606,6 +606,7 @@ def push(
 
     avg_score = sum(_extract_score(s) for s in scores) / len(scores)
     total_tokens = sum(s.get("tokens_input", 0) + s.get("tokens_output", 0) for s in scores)
+    total_cost_usd = sum(float(s.get("total_cost_usd") or 0) for s in scores)
     total_ms = sum(s.get("execution_time_ms", 0) for s in scores)
     avg_latency = total_ms / len(scores) if scores else 0
 
@@ -622,6 +623,8 @@ def push(
         "benchmark_id": bid,
         "model_id": model_id or data.get("model_id", ""),
         "overall_score": round(avg_score, 2),
+        "total_tokens": total_tokens or None,
+        "total_cost_usd": round(total_cost_usd, 6) if total_cost_usd > 0 else None,
         "metrics": {
             "avg_latency_ms": round(avg_latency, 2),
             "total_tokens": total_tokens,

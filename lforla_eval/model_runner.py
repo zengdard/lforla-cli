@@ -13,6 +13,45 @@ from typing import Any
 
 import httpx
 
+# Optional per-1000-token pricing (USD) for cost-per-task metrics.
+# Common pricing map for known model families (USD per 1K tokens).
+# Overridable via LFORLA_PRICE_PER_1K_IN / LFORLA_PRICE_PER_1K_OUT env vars;
+# unknown models default to None so cost metrics stay hidden.
+PRICING: dict[str, tuple[float | None, float | None]] = {}
+
+
+def load_pricing() -> None:
+    """Populate the pricing table from environment overrides (input, output)."""
+    import os as _os
+
+    defaults = {
+        # family: (input_per_1k, output_per_1k)
+        "gpt-4o": (0.0025, 0.010),
+        "gpt-4o-mini": (0.00015, 0.0006),
+        "gpt-4": (0.03, 0.06),
+        "claude-3-opus": (0.015, 0.075),
+        "claude-3-5-sonnet": (0.003, 0.015),
+        "claude-3-5-haiku": (0.0008, 0.004),
+    }
+    for family, (pin, pout) in defaults.items():
+        PRICING[family] = (pin, pout)
+
+    def _num(v: str | None) -> float | None:
+        if v in (None, ""):
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    pin = _num(_os.getenv("LFORLA_PRICE_PER_1K_IN"))
+    pout = _num(_os.getenv("LFORLA_PRICE_PER_1K_OUT"))
+    if pin is not None or pout is not None:
+        PRICING["*"] = (pin, pout)
+
+
+load_pricing()
+
 
 class ModelRunner:
     """Calls an LLM API for each sample and returns the result."""
@@ -21,6 +60,33 @@ class ModelRunner:
         self.model_id = model_id
         self.provider = provider
         self.api_key = api_key or os.getenv(f"{provider.upper()}_API_KEY") or ""
+
+    def estimate_cost_usd(self, tokens_input: int, tokens_output: int) -> float | None:
+        """Estimate cost in USD for a call using the pricing table.
+
+        Falls back: longest model-family prefix match, then the wildcard override.
+        Returns None when no pricing is known so cost metrics stay hidden.
+        """
+        cur = PRICING.get(self.model_id)
+        if cur is None:
+            model = self.model_id.lower()
+            cur = next(
+                (PRICING[k] for k in PRICING if k != "*" and model.startswith(k.lower())),
+                None,
+            )
+        if cur is None:
+            cur = PRICING.get("*")
+        if cur is None or (cur[0] is None and cur[1] is None):
+            return None
+        pin = cur[0] or 0.0
+        pout = cur[1] or 0.0
+        return (tokens_input / 1000 * pin) + (tokens_output / 1000 * pout)
+
+    def _attach_cost(self, result: dict) -> dict:
+        cost = self.estimate_cost_usd(int(result.get("tokens_input", 0)), int(result.get("tokens_output", 0)))
+        if cost is not None:
+            result["total_cost_usd"] = round(cost, 6)
+        return result
 
     # ========================================================================
     # Single turn (legacy / non-oracle)
@@ -31,17 +97,17 @@ class ModelRunner:
         prompt = input_data.get("prompt") or input_data.get("instruction") or input_data.get("text", "")
 
         if self.provider == "mock":
-            return self._run_mock(prompt)
+            return self._attach_cost(self._run_mock(prompt))
         if not self.api_key and self.provider in ("openai", "anthropic"):
             raise RuntimeError(f"Missing API key. Set {self.provider.upper()}_API_KEY or pass --api-key")
         if self.provider == "openai":
-            return self._run_openai(prompt)
+            return self._attach_cost(self._run_openai(prompt))
         elif self.provider == "anthropic":
-            return self._run_anthropic(prompt)
+            return self._attach_cost(self._run_anthropic(prompt))
         elif self.provider == "ollama":
-            return self._run_ollama(prompt)
+            return self._attach_cost(self._run_ollama(prompt))
         else:
-            return self._run_generic(prompt)
+            return self._attach_cost(self._run_generic(prompt))
 
     # ========================================================================
     # Oracle (agentic, tool-calling)
@@ -75,14 +141,14 @@ class ModelRunner:
             tokens_in = len(prompt.split())
             tokens_out = len(content.split())
             elapsed = int((time.time() - start) * 1000)
-            return {
+            return self._attach_cost({
                 "output": content,
                 "execution_time_ms": elapsed,
                 "tokens_input": tokens_in,
                 "tokens_output": tokens_out,
                 "tool_calls": calls_used,
                 "iterations": max(1, len(tool_calls)),
-            }
+            })
 
         if not self.api_key and self.provider in ("openai", "anthropic"):
             raise RuntimeError(f"Missing API key. Set {self.provider.upper()}_API_KEY or pass --api-key")
@@ -99,14 +165,14 @@ class ModelRunner:
             messages, tool_specs, handle_call, max_iterations
         )
         elapsed = int((time.time() - start) * 1000)
-        return {
+        return self._attach_cost({
             "output": content,
             "execution_time_ms": elapsed,
             "tokens_input": usage_in,
             "tokens_output": usage_out,
             "tool_calls": tool_calls,
             "iterations": len(tool_calls),
-        }
+        })
 
     def _chat_openai(
         self, messages: list[dict], tools: list[dict] | None = None
