@@ -1,4 +1,10 @@
-"""Model runner — calls LLM APIs to evaluate benchmark samples."""
+"""Model runner — calls LLM APIs to evaluate benchmark samples.
+
+Supports both single-turn evaluation (``run_sample``) and agentic oracle
+evaluation with tool-calling (``run_oracle_sample``).
+"""
+
+from __future__ import annotations
 
 import json
 import os
@@ -16,6 +22,9 @@ class ModelRunner:
         self.provider = provider
         self.api_key = api_key or os.getenv(f"{provider.upper()}_API_KEY") or ""
 
+    # ========================================================================
+    # Single turn (legacy / non-oracle)
+    # ========================================================================
     def run_sample(self, sample: dict) -> dict:
         """Run a single sample through the model."""
         input_data = sample.get("input_data", {})
@@ -34,6 +43,303 @@ class ModelRunner:
         else:
             return self._run_generic(prompt)
 
+    # ========================================================================
+    # Oracle (agentic, tool-calling)
+    # ========================================================================
+    def run_oracle_sample(
+        self,
+        prompt: str,
+        tool_specs: list[dict],
+        handle_call: Any,
+        *,
+        max_iterations: int = 12,
+        system: str | None = None,
+    ) -> dict:
+        """Run an agentic loop where the model may call oracle tools.
+
+        ``tool_specs`` is the provider-specific tool list.
+        ``handle_call(name, args)`` is invoked for every tool call and its
+        return value is fed back to the model.
+
+        Returns the same shape as ``run_sample`` (``output``, token counts,
+        latency) plus ``tool_calls`` and ``iterations``.
+        """
+        start = time.time()
+        total_in = 0
+        total_out = 0
+        calls_used: list[dict] = []
+
+        if self.provider == "mock":
+            content, tool_calls = self._oracle_mock(prompt, handle_call)
+            calls_used = tool_calls
+            tokens_in = len(prompt.split())
+            tokens_out = len(content.split())
+            elapsed = int((time.time() - start) * 1000)
+            return {
+                "output": content,
+                "execution_time_ms": elapsed,
+                "tokens_input": tokens_in,
+                "tokens_output": tokens_out,
+                "tool_calls": calls_used,
+                "iterations": max(1, len(tool_calls)),
+            }
+
+        if not self.api_key and self.provider in ("openai", "anthropic"):
+            raise RuntimeError(f"Missing API key. Set {self.provider.upper()}_API_KEY or pass --api-key")
+
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        runner = self._oracle_loop_openai if self.provider == "openai" else \
+            (self._oracle_loop_anthropic if self.provider == "anthropic" else self._oracle_loop_generic)
+
+        content, tool_calls, usage_in, usage_out = runner(
+            messages, tool_specs, handle_call, max_iterations
+        )
+        elapsed = int((time.time() - start) * 1000)
+        return {
+            "output": content,
+            "execution_time_ms": elapsed,
+            "tokens_input": usage_in,
+            "tokens_output": usage_out,
+            "tool_calls": tool_calls,
+            "iterations": len(tool_calls),
+        }
+
+    def _chat_openai(
+        self, messages: list[dict], tools: list[dict] | None = None
+    ) -> dict:
+        client = httpx.Client(base_url="https://api.openai.com/v1", timeout=120)
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        body: dict = {"model": self.model_id, "messages": messages, "max_tokens": 2048}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        r = client.post("/chat/completions", json=body, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+    def _oracle_loop_openai(self, messages, tool_specs, handle_call, max_iterations):
+        tool_calls_log = []
+        total_in = 0
+        total_out = 0
+        final_content = ""
+        for _ in range(max_iterations):
+            data = self._chat_openai(messages, tools=tool_specs or None)
+            msg = data["choices"][0]["message"]
+            usage = data.get("usage", {})
+            total_in += usage.get("prompt_tokens", 0)
+            total_out += usage.get("completion_tokens", 0)
+
+            tc = msg.get("tool_calls")
+            if not tc:
+                final_content = msg.get("content", "") or ""
+                break
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content"),
+                    "tool_calls": [
+                        {
+                            "id": t["id"],
+                            "type": "function",
+                            "function": {"name": t["function"]["name"], "arguments": t["function"]["arguments"]},
+                        }
+                        for t in tc
+                    ],
+                }
+            )
+            for t in tc:
+                name = t["function"]["name"]
+                try:
+                    args = json.loads(t["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                try:
+                    result = handle_call(name, args)
+                except Exception as e:  # noqa: BLE001
+                    result = {"error": str(e)}
+                tool_calls_log.append({"name": name, "args": args})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": t["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        return final_content, tool_calls_log, total_in, total_out
+
+    def _chat_anthropic(self, messages, tools=None) -> dict:
+        client = httpx.Client(base_url="https://api.anthropic.com/v1", timeout=120)
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        body: dict = {"model": self.model_id, "max_tokens": 2048, "messages": messages}
+        if tools:
+            body["tools"] = tools
+        r = client.post("/messages", json=body, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+    def _oracle_loop_anthropic(self, messages, tool_specs, handle_call, max_iterations):
+        tool_calls_log = []
+        total_in = 0
+        total_out = 0
+        final_content = ""
+        for _ in range(max_iterations):
+            data = self._chat_anthropic(messages, tools=tool_specs or None)
+            content_blocks = data.get("content", [])
+            usage = data.get("usage", {})
+            total_in += usage.get("input_tokens", 0)
+            total_out += usage.get("output_tokens", 0)
+
+            tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
+            if not tool_uses:
+                final_content = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
+                break
+
+            assistant_block = {
+                "role": "assistant",
+                "content": content_blocks,
+            }
+            messages.append(assistant_block)
+            tool_results = []
+            for b in tool_uses:
+                name = b["name"]
+                args = b.get("input") or {}
+                try:
+                    result = handle_call(name, args)
+                except Exception as e:  # noqa: BLE001
+                    result = {"error": str(e)}
+                tool_calls_log.append({"name": name, "args": args})
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": b["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+        return final_content, tool_calls_log, total_in, total_out
+
+    def _oracle_loop_generic(self, messages, tool_specs, handle_call, max_iterations):
+        """Fallback for providers without native tool-calling (ollama/generic).
+
+        Injects the available tools into the system prompt and instructs the
+        model to emit tool calls as JSON lines prefixed with ``TOOL:``.
+        """
+        tool_desc = "\n".join(
+            f"- {s.get('name')}: {s.get('description', '')}\n  input: {json.dumps(s.get('input_schema') or s.get('function', {}).get('parameters') or {}, ensure_ascii=False)}"
+            for s in tool_specs
+        )
+        oracle_system = (
+            f"You are an autonomous agent. You have access to these tools:\n{tool_desc}\n\n"
+            "To call a tool, reply exactly with one JSON object on a single line prefixed by 'TOOL:' like:\n"
+            'TOOL: {"name": "tool_name", "args": {...}}\n\n'
+            "Keep calling tools until you have enough information, then emit your final answer "
+            "as plain text (a JSON object on its own is also accepted)."
+        )
+        sys_msgs = [{"role": "system", "content": oracle_system}]
+        for m in messages:
+            if m.get("role") == "system":
+                continue
+            sys_msgs.append(m)
+        msgs = sys_msgs
+
+        tool_calls_log = []
+        total_in = 0
+        total_out = 0
+        final_content = ""
+        for _ in range(max_iterations):
+            content, tin, tout = self._chat_text(msgs)
+            total_in += tin
+            total_out += tout
+            lines = [l for l in content.splitlines() if l.strip().startswith("TOOL:")]
+            if not lines:
+                final_content = content
+                break
+            parsed_any = False
+            for line in lines:
+                try:
+                    call = json.loads(line.split("TOOL:", 1)[1].strip())
+                except json.JSONDecodeError:
+                    continue
+                name = call.get("name")
+                args = call.get("args") or {}
+                try:
+                    result = handle_call(name, args)
+                except Exception as e:  # noqa: BLE001
+                    result = {"error": str(e)}
+                tool_calls_log.append({"name": name, "args": args})
+                msgs.append({"role": "assistant", "content": line})
+                msgs.append(
+                    {"role": "user", "content": f"TOOL RESULT ({name}): {json.dumps(result, ensure_ascii=False)}"}
+                )
+                parsed_any = True
+            if not parsed_any:
+                final_content = content
+                break
+        return final_content, tool_calls_log, total_in, total_out
+
+    def _chat_text(self, messages: list[dict]) -> tuple[str, int, int]:
+        """Single text chat call for generic providers (ollama/generic). Returns (content, in, out)."""
+        if self.provider == "ollama":
+            base = os.getenv("OLLAMA_URL", "http://localhost:11434")
+            client = httpx.Client(base_url=base, timeout=300)
+            body = {"model": self.model_id, "messages": messages, "stream": False}
+            r = client.post("/api/chat", json=body)
+            r.raise_for_status()
+            data = r.json()
+            content = data.get("message", {}).get("content", "")
+            return content, len(json.dumps(messages).split()), len(content.split())
+
+        endpoint = os.getenv("LLM_ENDPOINT", "")
+        if not endpoint:
+            raise RuntimeError("LLM_ENDPOINT environment variable required for generic provider")
+        client = httpx.Client(base_url=endpoint, timeout=120)
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        body = {"model": self.model_id, "messages": messages, "max_tokens": 2048}
+        r = client.post("/chat/completions", json=body, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+        return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+
+    def _oracle_mock(self, prompt: str, handle_call) -> tuple[str, list[dict]]:
+        """Deterministic mock for testing the oracle plumbing without a provider."""
+        context = handle_call("get_context", {})
+        candidates = handle_call("get_candidates", {}) or {"candidates": []}
+        pool = candidates.get("candidates", [])
+        # Pick up to num_seats candidates, one per needed role (best skill match).
+        roles = context.get("roles", [])
+        chosen = []
+        for role in roles:
+            rname = (role.get("role") or "").lower()
+            for c in pool:
+                if str(c.get("role") or "").lower() == rname:
+                    chosen.append(c.get("id"))
+                    break
+        result = {
+            "team": [{"id": cid} for cid in chosen],
+            "justification": f"Mock oracle selection of {len(chosen)} candidates covering available roles.",
+        }
+        calls = [
+            {"name": "get_context", "args": {}},
+            {"name": "get_candidates", "args": {}},
+        ]
+        return json.dumps(result, ensure_ascii=False), calls
+
+    # ========================================================================
+    # Single-turn provider calls (legacy)
+    # ========================================================================
     def _run_openai(self, prompt: str) -> dict:
         start = time.time()
         client = httpx.Client(base_url="https://api.openai.com/v1", timeout=120)

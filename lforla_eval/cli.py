@@ -15,6 +15,11 @@ from rich.table import Table
 from . import __version__
 from .client import LforlaClient
 from .model_runner import ModelRunner
+from .oracle import (
+    RecruitmentOracle,
+    parse_final_team,
+    score_team,
+)
 
 app = typer.Typer(
     name="lforla-eval",
@@ -201,6 +206,74 @@ def bench_push(
         raise typer.Exit(1)
 
 
+def run_sample_any(runner: ModelRunner, sample: dict) -> dict:
+    """Run a sample through the runner, dispatching to the oracle agent path when the
+    sample declares a recruitment oracle (``oracle`` key present)."""
+    oracle_cfg = sample.get("oracle")
+    if not oracle_cfg:
+        return runner.run_sample(sample)
+
+    sample_id = sample.get("id", sample.get("sample_id", ""))
+    oracle = RecruitmentOracle(
+        candidates=oracle_cfg.get("candidates", []),
+        role_needs=oracle_cfg.get("role_needs", []),
+        num_seats=oracle_cfg.get("num_seats", 1),
+        total_budget=oracle_cfg.get("total_budget"),
+        context=oracle_cfg.get("context", ""),
+    )
+
+    scenario = sample.get("scenario") or oracle_cfg.get("context") or \
+        oracle_cfg.get("task_instruction", "")
+    system = (
+        "You are a recruitment manager assembling a team. You can query an oracle "
+        "with the provided tools to inspect the hiring context and the candidate pool. "
+        "Gather the information you need, then pick a team that best fits the CV criteria, "
+        "respecting the number of available seats and (if any) the total budget. "
+        "Respond with a JSON object that has a 'team' (array of {id}) and a 'justification' (string), "
+        "and nothing else."
+    )
+    prompt = (
+        f"Scenario: {scenario}\n"
+        "Build your team and justify it. You MUST call the oracle tools to inspect "
+        "candidates before finalizing. Return your final answer as a single JSON object "
+        '{"team": [{"id": "..."}, ...], "justification": "..."}.'
+    )
+
+    tool_specs = oracle.get_tool_specs(provider=runner.provider)
+    callers = oracle.get_tool_callers()
+
+    def handle_call(name: str, args: dict):
+        if name not in callers:
+            return {"error": f"Unknown tool: {name}"}
+        return callers[name](args)
+
+    result = runner.run_oracle_sample(
+        prompt,
+        tool_specs,
+        handle_call,
+        system=system,
+    )
+
+    output = result.get("output", "")
+    chosen = parse_final_team(output)
+    if chosen is None:
+        team = []
+    else:
+        team = [
+            {"id": cid} for cid in chosen
+            if any(str(c.get("id")) == str(cid) for c in oracle.candidates)
+        ]
+
+    scoring = score_team(team, oracle, include_debug=True)
+    result["score"] = scoring["overall_score"]
+    result["overall_score"] = scoring["overall_score"]
+    result["team"] = team
+    result["criteria"] = scoring["criteria"]
+    result["sample_id"] = sample_id
+    result["metrics"] = {**result.get("metrics", {}), **scoring["criteria"]}
+    return result
+
+
 @app.command()
 def run(
     input_file: str = typer.Argument(
@@ -227,10 +300,24 @@ def run(
         raise typer.Exit(1)
 
     raw = path.read_text()
-    samples = json.loads(raw) if raw.strip().startswith("{") else yaml.safe_load(raw)
+    stripped = raw.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            samples = json.loads(stripped)
+            if isinstance(samples, dict):
+                samples = samples.get("samples", samples.get("data", []))
+                if not isinstance(samples, list):
+                    samples = [samples]
+        except json.JSONDecodeError:
+            # Not a single JSON document → try JSONL (one JSON object per line)
+            samples = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    else:
+        samples = yaml.safe_load(raw)
+        if isinstance(samples, dict):
+            samples = samples.get("samples", samples.get("data", [samples]))
+        else:
+            samples = list(samples) if samples is not None else []
 
-    if isinstance(samples, dict):
-        samples = samples.get("samples", samples.get("data", [samples]))
     if not isinstance(samples, list):
         rprint("[red]Error:[/red] Input must be a JSON/YAML array or {samples: [...]}")
         raise typer.Exit(1)
@@ -247,7 +334,7 @@ def run(
             sample_id = sample.get("id", sample.get("sample_id", str(i)))
             status.update(f"[{i+1}/{total}] Running sample {sample_id}...")
             try:
-                result = runner.run_sample(sample)
+                result = run_sample_any(runner, sample)
                 result["sample_id"] = sample_id
                 results.append(result)
             except Exception as e:
@@ -522,6 +609,15 @@ def push(
     total_ms = sum(s.get("execution_time_ms", 0) for s in scores)
     avg_latency = total_ms / len(scores) if scores else 0
 
+    metric_names = ["role_coverage", "skill_match", "budget", "seat_limit",
+                    "seniority_balance", "meets_min_seniority"]
+    oracle_metrics = {}
+    for name in metric_names:
+        vals = [s.get("criteria", {}).get(name) for s in scores
+                if isinstance(s.get("criteria"), dict) and s.get("criteria", {}).get(name) is not None]
+        if vals:
+            oracle_metrics[name] = round(sum(vals) / len(vals), 3)
+
     payload = {
         "benchmark_id": bid,
         "model_id": model_id or data.get("model_id", ""),
@@ -530,6 +626,7 @@ def push(
             "avg_latency_ms": round(avg_latency, 2),
             "total_tokens": total_tokens,
             "sample_count": len(scores),
+            **oracle_metrics,
         },
         "visibility": visibility,
     }
