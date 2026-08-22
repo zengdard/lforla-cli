@@ -177,7 +177,12 @@ def _chat(model_id: str, user_prompt: str) -> tuple[str, int, int]:
     return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
 
 
-def aggregate(answers: dict[str, float], statements: list[dict], meta: dict) -> dict:
+def aggregate(
+    answers: dict[str, float],
+    statements: list[dict],
+    meta: dict,
+    return_support: bool = False,
+):
     axis_sums: dict[str, float] = defaultdict(float)
     axis_max: dict[str, float] = defaultdict(float)
     paired_axes: set[str] = set()
@@ -208,51 +213,128 @@ def aggregate(answers: dict[str, float], statements: list[dict], meta: dict) -> 
         if axis not in paired_axes and mx > 0:
             axes_pct[axis] = round(100 * axis_sums[axis] / mx, 1)
 
+    if return_support:
+        # Number of distinct statements feeding each axis — axes backed by a
+        # single statement are low-confidence indicators (one NEUTRAL answer
+        # collapses them to 0).
+        axis_support: dict[str, int] = defaultdict(int)
+        for s in statements:
+            for w in s.get("weightsYes", []) + s.get("weightsNo", []):
+                axis_support[w["axis"]] += 1
+        return axes_pct, axis_support
+
     return axes_pct
 
 
-def run_politiscales(model_id: str, data_path: str, language: str = "en") -> dict:
+
+def _axis_support(statements: list[dict]) -> tuple[dict[str, int], list[str]]:
+    """Return ({axis: statement_count}, [axes backed by fewer than 2 stmts])."""
+    from collections import defaultdict as _dd
+
+    support: dict[str, int] = _dd(int)
+    for s in statements:
+        for w in s.get("weightsYes", []) + s.get("weightsNo", []):
+            support[w["axis"]] += 1
+    low = sorted(a for a, n in support.items() if n < 2)
+    return support, low
+
+def run_politiscales(
+    model_id: str, data_path: str, language: str = "en", runs: int = 1
+) -> dict:
+    """Run the questionnaire ``runs`` times and aggregate.
+
+    With ``runs > 1`` each axis is reported as its mean across runs plus a
+    ``*_std`` sample standard deviation, so unstable models are visible
+    instead of silently averaged into a fake precision.
+    """
+    import statistics
+
     statements, meta = load_questionnaire(data_path)
-    answers: dict[str, float] = {}
+    runs_axes: list[dict[str, float]] = []
+    compliances: list[float] = []
     tokens_in = tokens_out = 0
     start = time.time()
-    valid_batches = 0
+    answered_total = 0
+    total_statements = len(statements)
 
-    for i in range(0, len(statements), BATCH_SIZE):
-        batch = statements[i : i + BATCH_SIZE]
-        prompt = _build_batch_prompt(batch, language)
-        raw, tin, tout = _chat(model_id, prompt)
-        tokens_in += tin
-        tokens_out += tout
-        parsed = _parse_answers(raw, batch)
-        covered = sum(1 for s in batch if s["id"] in parsed)
-        if covered >= len(batch) // 2:
-            valid_batches += 1
-        print(
-            f"[politiscales] batch {i // BATCH_SIZE + 1}: "
-            f"{covered}/{len(batch)} statements answered",
-            flush=True,
-        )
-        answers.update(parsed)
+    # Axis support computed once: axes fed by a single statement are
+    # low-confidence indicators.
+    axis_support, low_confidence_map = _axis_support(statements)
+    low_confidence = sorted(low_confidence_map)
 
-    answered = sum(1 for s in statements if s["id"] in answers)
-    compliance = round(100 * answered / len(statements), 1)
-    axes_pct = aggregate(answers, statements, meta)
+    for r in range(runs):
+        answers: dict[str, float] = {}
+        for i in range(0, len(statements), BATCH_SIZE):
+            batch = statements[i : i + BATCH_SIZE]
+            prompt = _build_batch_prompt(batch, language)
+            raw, tin, tout = _chat(model_id, prompt)
+            tokens_in += tin
+            tokens_out += tout
+            parsed = _parse_answers(raw, batch)
+            covered = sum(1 for s in batch if s["id"] in parsed)
+            print(
+                f"[politiscales] run {r + 1}/{runs} "
+                f"batch {i // BATCH_SIZE + 1}: {covered}/{len(batch)} answered",
+                flush=True,
+            )
+            answers.update(parsed)
+
+        answered = sum(1 for s in statements if s["id"] in answers)
+        answered_total += answered
+        compliances.append(round(100 * answered / total_statements, 1))
+        ra = aggregate(answers, statements, meta)
+        # A single-statement axis with no decisive answer is NOT a measured
+        # position — report it as null instead of a misleading 0%.
+        for axis in low_confidence:
+            supporting = [
+                s for s in statements
+                if any(w["axis"] == axis for w in s.get("weightsYes", []) + s.get("weightsNo", []))
+            ]
+            if all(abs(answers.get(s["id"], 0.0)) == 0.0 for s in supporting):
+                ra[axis] = None
+        runs_axes.append(ra)
+
+    # Mean across runs per axis; std only meaningful with runs > 1.
+    all_axes = sorted({k for ra in runs_axes for k in ra})
+    axes_mean: dict[str, float | None] = {}
+    axes_std: dict[str, float] = {}
+    for axis in all_axes:
+        vals = [ra[axis] for ra in runs_axes if ra.get(axis) is not None]
+        if vals:
+            axes_mean[axis] = round(sum(vals) / len(vals), 1)
+            axes_std[axis] = (
+                round(statistics.stdev(vals), 2) if len(vals) > 1 else 0.0
+            )
+        else:
+            axes_mean[axis] = None
+            axes_std[axis] = 0.0
+
+    compliance = round(sum(compliances) / len(compliances), 1)
+    answered_avg = round(answered_total / runs)
     elapsed_ms = int((time.time() - start) * 1000)
 
-    metrics = {"axes": axes_pct}
-    metrics.update({f"axis_{k}": v for k, v in axes_pct.items()})
+    metrics = {"axes": axes_mean}
+    metrics.update({f"axis_{k}": v for k, v in axes_mean.items()})
     metrics.update(
         {
             "protocol_compliance_pct": compliance,
-            "answered_statements": answered,
-            "total_statements": len(statements),
+            "answered_statements": answered_avg,
+            "total_statements": total_statements,
+            "runs": runs,
         }
     )
+    metrics["low_confidence_axes"] = low_confidence
+    if runs > 1:
+        metrics["axes_std"] = axes_std
+        metrics.update({f"axis_{k}_std": v for k, v in axes_std.items()})
+        unstable = sorted(
+            (k for k, v in axes_std.items() if v > 10.0),
+        )
+        metrics["unstable_axes"] = unstable
 
     return {
-        "sample_id": "politiscales_full",
-        "output": json.dumps(axes_pct),
+        "sample_id": f"politiscales_full_r{runs}",
+        "output": json.dumps(axes_mean),
         "score": compliance,
         "overall_score": compliance,
         "criteria": metrics,

@@ -334,6 +334,9 @@ def run(
     limit: Optional[int] = typer.Option(
         None, "--limit", "-n", help="Only run first N samples"
     ),
+    runs: Optional[int] = typer.Option(
+        None, "--runs", "-r", help="[politiscales] Repeat the survey N times and aggregate mean/std per axis"
+    ),
 ):
     """Run a benchmark locally by calling an LLM API."""
     path = Path(input_file)
@@ -380,7 +383,7 @@ def run(
         from .politiscales import run_politiscales
 
         rprint(f"[bold]PolitiScales survey:[/bold] {len(samples)} statements")
-        result = run_politiscales(model, input_file)
+        result = run_politiscales(model, input_file, runs=runs or 1)
         output_data = {
             "benchmark_id": benchmark_id,
             "model": model,
@@ -710,6 +713,12 @@ def push(
                 oracle_metrics[key] = round(float(val), 3)
             elif isinstance(val, dict):
                 oracle_metrics[key] = val
+                # Flatten named groups (e.g. PolitiScales "axes") so charts
+                # that read scalar metric keys (metrics.capitalism) work.
+                if key == "axes":
+                    for sub_key, sub_val in val.items():
+                        if isinstance(sub_val, (int, float)) and not isinstance(sub_val, bool):
+                            oracle_metrics.setdefault(sub_key, round(float(sub_val), 3))
 
     payload = {
         "benchmark_id": bid,
