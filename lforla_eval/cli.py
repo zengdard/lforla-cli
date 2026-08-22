@@ -700,6 +700,17 @@ def push(
         if vals:
             oracle_metrics[name] = round(sum(vals) / len(vals), 3)
 
+    # Generic pass-through: any other numeric criteria plus nested dicts
+    # (e.g. PolitiScales "axes") from single-result runs.
+    for s in scores:
+        for key, val in (s.get("criteria") or {}).items():
+            if key in oracle_metrics or key in metric_names:
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                oracle_metrics[key] = round(float(val), 3)
+            elif isinstance(val, dict):
+                oracle_metrics[key] = val
+
     payload = {
         "benchmark_id": bid,
         "model_id": model_id or data.get("model_id", ""),
