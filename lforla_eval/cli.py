@@ -16,8 +16,13 @@ from . import __version__
 from .client import LforlaClient
 from .model_runner import ModelRunner
 from .oracle import (
+    DRONE_SYSTEM_PROMPT,
+    DroneOracle,
     RecruitmentOracle,
+    parse_final_json,
     parse_final_team,
+    run_drone_sample,
+    sanitize_drone_output,
     score_team,
 )
 
@@ -206,13 +211,50 @@ def bench_push(
         raise typer.Exit(1)
 
 
+def _score_drone_via_backend(sample_id: str, output: dict | None, oracle_calls: int) -> dict:
+    """Score a drone-build output against the deterministic backend oracle."""
+    body = {
+        "sample_id": sample_id,
+        "output": output,
+        "agent_behavior": {
+            "json_valid": isinstance(output, dict),
+            "oracle_calls": oracle_calls,
+            "distinct_informative_calls": oracle_calls,
+        },
+    }
+    return client.post("/scoring/drone-build", json_body=body)
+
+
 def run_sample_any(runner: ModelRunner, sample: dict) -> dict:
-    """Run a sample through the runner, dispatching to the oracle agent path when the
-    sample declares a recruitment oracle (``oracle`` key present)."""
+    """Run a sample through the runner.
+
+    Dispatch order:
+      1. ``bom_mode`` key present          → drone-build agentic oracle path
+      2. ``oracle`` key present            → recruit-equipe agentic oracle path
+      3. otherwise                         → single-turn
+    """
+    if "bom_mode" in sample or sample.get("benchmark_kind") == "drone-build":
+        result = run_drone_sample(runner, sample)
+        sanitized = sanitize_drone_output(result.get("output_parsed"))
+        try:
+            scored = _score_drone_via_backend(
+                result["sample_id"], sanitized, result.get("oracle_calls", 0)
+            )
+        except Exception as e:
+            # Unparseable JSON / contract violation: score 0 rather than drop
+            # the sample so weak models still appear on the leaderboard.
+            rprint(f"   [yellow]scoring failed ({e}) — recording 0[/yellow]")
+            scored = {"overall_score": 0, "score": 0, "metrics": {}, "criteria": {}}
+        result["score"] = scored.get("overall_score", scored.get("score", 0))
+        result["overall_score"] = result["score"]
+        result["metrics"] = scored.get("metrics", {})
+        result["criteria"] = scored.get("metrics", {})
+        result["gates"] = scored.get("gates")
+        return result
+
     oracle_cfg = sample.get("oracle")
     if not oracle_cfg:
         return runner.run_sample(sample)
-
     sample_id = sample.get("id", sample.get("sample_id", ""))
     oracle = RecruitmentOracle(
         candidates=oracle_cfg.get("candidates", []),
@@ -610,8 +652,15 @@ def push(
     total_ms = sum(s.get("execution_time_ms", 0) for s in scores)
     avg_latency = total_ms / len(scores) if scores else 0
 
-    metric_names = ["role_coverage", "skill_match", "budget", "seat_limit",
-                    "seniority_balance", "meets_min_seniority"]
+    metric_names = [
+        "role_coverage", "skill_match", "budget", "seat_limit",
+        "seniority_balance", "meets_min_seniority",
+        # drone-build
+        "bom_completeness", "compatibility_score", "performance_score",
+        "mass_accuracy", "thrust_accuracy", "endurance_accuracy",
+        "internal_consistency", "cad_validity_score", "cad_consistency_score",
+        "printability_score",
+    ]
     oracle_metrics = {}
     for name in metric_names:
         vals = [s.get("criteria", {}).get(name) for s in scores

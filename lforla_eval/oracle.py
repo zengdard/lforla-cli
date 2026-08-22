@@ -300,6 +300,25 @@ def parse_final_team(output: str) -> list[str] | None:
     Accepts both a pure-JSON document and a ``{"team": [...], "justification": ...}``
     object embedded in markdown/multi-line prose.
     """
+    decoded = parse_final_json(output)
+    if isinstance(decoded, dict):
+        team = decoded.get("team")
+        if isinstance(team, list):
+            return [str(row.get("id") or row) for row in team if isinstance(row, (dict, str))]
+        return None
+    if isinstance(decoded, list):
+        return [str(row.get("id") or row) for row in decoded]
+    return None
+
+
+def parse_final_json(output: str) -> Any:
+    """Extract the first JSON object/array from the model's final answer.
+
+    Accepts pure JSON, JSON embedded in markdown fences, or JSON buried in
+    prose. Falls back to ``json_repair`` for structurally broken LLM JSON
+    (unescaped quotes/brackets in embedded code are common). Returns
+    ``None`` when nothing salvageable is found.
+    """
     if not output:
         return None
     text = output.strip()
@@ -310,21 +329,337 @@ def parse_final_team(output: str) -> list[str] | None:
             text = code_blocks[0].strip()
 
     try:
-        decoded = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find the first JSON object
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        try:
-            decoded = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
+        pass
 
-    team = decoded.get("team") if isinstance(decoded, dict) else None
-    if isinstance(team, list):
-        return [str(row.get("id") or row) for row in team if isinstance(row, (dict, str))]
-    if isinstance(decoded, list):
-        return [str(row.get("id") or row) for row in decoded]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    try:
+        from json_repair import repair_json
+
+        repaired = repair_json(text, return_objects=True)
+        if isinstance(repaired, (dict, list)):
+            return repaired
+    except ImportError:
+        pass
     return None
+
+
+# ============================================================================
+# Drone build oracle
+# ============================================================================
+
+class DroneOracle:
+    """An oracle that exposes a drone design mission and its component catalog.
+
+    Backs the ``drone-build`` benchmark. Two information tiers mirror the
+    backend contract: ``get_catalog_summary`` lists parts with prices only,
+    while full datasheets (masses, KV, currents, thrust tables) are revealed
+    one part at a time via ``get_component`` — forcing the model to explore
+    and do its own engineering math.
+
+    Use ``get_tool_specs()`` to build the provider tool list and
+    ``handle_call(name, args)`` to service tool calls.
+    """
+
+    def __init__(self, sample: dict):
+        self.sample_id = sample.get("id", "")
+        self.bom_mode = sample.get("bom_mode", "catalog")
+        self.mission: dict = sample.get("mission", {}) or {}
+        self.catalog: list[dict] = sample.get("catalog", []) or []
+        self._by_id = {str(c.get("id")): c for c in self.catalog}
+
+    # -- tools -------------------------------------------------------------
+    def get_tool_specs(self, provider: str = "openai") -> list[dict]:
+        def fn(name, description, properties, required_=()):
+            params = {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False,
+            }
+            if required_:
+                params["required"] = list(required_)
+            if provider == "anthropic":
+                return anthropic_tool_spec(name, description, params)
+            return openai_tool_spec(name, description, params)
+
+        specs = [
+            fn(
+                "get_mission",
+                "Return the mission brief: description, hard constraints (budget USD, minimum "
+                "thrust-to-weight, flight time target, wheelbase class, max prop size...), the "
+                "required and optional component types, and whether an engineering analysis "
+                "block is required.",
+                {},
+            ),
+            fn(
+                "get_catalog_summary",
+                "List every component in the catalog with ID, type, name, manufacturer, "
+                "part number and unit price ONLY. Full specs (mass, KV, currents, thrust "
+                "table, dimensions) require per-part get_component calls.",
+                {
+                    "component_type": {
+                        "type": "string",
+                        "description": "Optional filter by component type (e.g. motor, esc, battery)",
+                    },
+                },
+            ),
+            fn(
+                "get_component",
+                "Return the FULL datasheet of one component by id: mass_g, unit_price_usd "
+                "and the complete specs object (KV, currents, thrust table, dimensions...).",
+                {"part_id": {"type": "string", "description": "Component id from get_catalog_summary"}},
+                ("part_id",),
+            ),
+        ]
+        return specs
+
+    def get_tool_callers(self) -> dict[str, Callable]:
+        return {
+            "get_mission": self._call_mission,
+            "get_catalog_summary": self._call_catalog_summary,
+            "get_component": self._call_component,
+        }
+
+    # -- implementations ----------------------------------------------------
+    def _call_mission(self, args: dict) -> dict:
+        m = self.mission
+        out: dict[str, Any] = {
+            "mission_id": self.sample_id,
+            "description": m.get("description", ""),
+            "constraints": m.get("constraints", {}),
+            "required_component_types": m.get("required_component_types", []),
+            "optional_component_types": m.get("optional_component_types", []),
+            "requires_analysis": bool(m.get("requires_analysis")),
+            "bom_mode": self.bom_mode,
+        }
+        if self.bom_mode == "open":
+            out["note"] = (
+                "OPEN BOM MODE: no catalog is provided. Cite real commercially available parts "
+                "by name/part number in part_id."
+            )
+        return out
+
+    def _call_catalog_summary(self, args: dict) -> dict:
+        ctype = (args.get("component_type") or "").lower()
+        out = []
+        for c in self.catalog:
+            if ctype and ctype not in (c.get("type", "") or "").lower():
+                continue
+            out.append(
+                {
+                    k: c[k]
+                    for k in ("id", "type", "name", "manufacturer", "part_number", "unit_price_usd")
+                    if k in c
+                }
+            )
+        return {"count": len(out), "components": out}
+
+    def _call_component(self, args: dict) -> dict:
+        pid = args.get("part_id", "")
+        comp = self._by_id.get(str(pid))
+        if comp is None:
+            return {"found": False, "error": f"No component with id {pid}"}
+        return {"found": True, "component": comp}
+
+
+DRONE_SYSTEM_PROMPT = """You are an experienced multirotor engineer. Query the oracle to inspect the mission \
+constraints, then explore the component catalog: get_catalog_summary lists parts with \
+prices only — full specs (masses, KV, currents, thrust tables) require per-part \
+get_component calls. Design the complete build within budget, verify electrical \
+compatibility (KV vs cells, ESC/battery current margins), and compute YOURSELF the \
+all-up weight, total thrust, thrust-to-weight, hover current and estimated flight time. \
+Declare your math in the analysis block. Author parametric OpenSCAD source for the frame \
+structure. Return STRICT JSON:
+{"architecture": "...",
+ "bom": [{"component_type": "...", "part_id": "...", "quantity": N}],
+ "total_cost_usd": F,
+ "analysis": {...},
+ "cad": {"format": "openscad", "files": [{"name": "frame.scad", "content": "..."}]},
+ "justification": "..."}"""
+
+
+DRONE_USER_PROMPT = """Design the drone for this mission. You MUST query get_mission first, then \
+explore the catalog with get_catalog_summary and inspect candidate components with \
+get_component before finalizing your BOM. Compute your own engineering analysis and author \
+the OpenSCAD frame source. Return your final answer as a single STRICT JSON object with keys \
+architecture, bom, total_cost_usd, analysis, cad, justification."""
+
+
+# Keys accepted by the backend's strict droneOutputSchema (Zod .strict()).
+_DRONE_ANALYSIS_KEYS = (
+    "component_masses",
+    "all_up_weight_g",
+    "thrust_per_motor_g",
+    "max_thrust_total_g",
+    "thrust_to_weight",
+    "hover_current_a",
+    "battery_sustained_current_a",
+    "estimated_flight_time_min",
+)
+
+
+def _num(value: Any) -> float | None:
+    """Best-effort numeric coercion ('531 g' -> 531.0)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().rstrip("gGAaVWwW ").replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def sanitize_drone_output(parsed: Any) -> dict | None:
+    """Conform a model's parsed drone-build answer to the strict output contract.
+
+    Real models routinely add bonus keys (dry_weight_g, ...), emit numbers as
+    strings, or overshoot length caps — the backend Zod schema is ``strict()``
+    and would reject the whole submission. This drops unknown keys, coerces
+    numerics and clamps lengths so the deterministic scorer sees a valid
+    contract without rewarding or punishing anything beyond it.
+    """
+    if not isinstance(parsed, dict):
+        return None
+
+    out: dict[str, Any] = {}
+
+    arch = parsed.get("architecture")
+    if isinstance(arch, str) and arch.strip():
+        out["architecture"] = arch.strip()[:120]
+
+    bom: list[dict] = []
+    for line in parsed.get("bom", []) or []:
+        if not isinstance(line, dict) or len(bom) >= 100:
+            continue
+        entry: dict[str, Any] = {}
+        for key in ("component_type", "part_id", "part_number", "name"):
+            value = line.get(key)
+            if isinstance(value, str) and value.strip():
+                entry[key] = value.strip()[:200]
+        qty = _num(line.get("quantity"))
+        if qty is not None:
+            entry["quantity"] = int(min(max(qty, 0), 100))
+        # A usable line must identify a part
+        if any(k in entry for k in ("part_id", "part_number", "name")):
+            bom.append(entry)
+    if bom:
+        out["bom"] = bom
+
+    cost = _num(parsed.get("total_cost_usd"))
+    if cost is not None:
+        out["total_cost_usd"] = min(max(cost, 0), 1_000_000)
+
+    analysis_raw = parsed.get("analysis")
+    if isinstance(analysis_raw, dict):
+        analysis: dict[str, Any] = {}
+        for key in _DRONE_ANALYSIS_KEYS:
+            value = analysis_raw.get(key)
+            if key == "component_masses":
+                masses: list[dict] = []
+                for m in value or []:
+                    if not isinstance(m, dict) or len(masses) >= 200:
+                        continue
+                    mass_entry: dict[str, Any] = {}
+                    pid = m.get("part_id")
+                    if isinstance(pid, str) and pid.strip():
+                        mass_entry["part_id"] = pid.strip()[:120]
+                    unit_mass = _num(m.get("unit_mass_g"))
+                    if unit_mass is not None:
+                        mass_entry["unit_mass_g"] = min(max(unit_mass, 0), 100_000)
+                    qty = _num(m.get("qty"))
+                    if qty is not None:
+                        mass_entry["qty"] = int(min(max(qty, 0), 100))
+                    if mass_entry:
+                        masses.append(mass_entry)
+                if masses:
+                    analysis[key] = masses
+            elif key == "thrust_per_motor_g" and isinstance(value, dict):
+                prop_inch = _num(value.get("prop_inch"))
+                thrust_g = _num(value.get("thrust_g"))
+                thrust_entry: dict[str, Any] = {}
+                if prop_inch is not None:
+                    thrust_entry["prop_inch"] = min(max(prop_inch, 0), 60)
+                if thrust_g is not None:
+                    thrust_entry["thrust_g"] = min(max(thrust_g, 0), 50_000)
+                if thrust_entry:
+                    analysis[key] = thrust_entry
+            else:
+                num = _num(value)
+                if num is not None:
+                    analysis[key] = num
+        if analysis:
+            out["analysis"] = analysis
+
+    cad_raw = parsed.get("cad")
+    if isinstance(cad_raw, dict):
+        cad: dict[str, Any] = {}
+        fmt = cad_raw.get("format")
+        if isinstance(fmt, str) and fmt.strip():
+            cad["format"] = fmt.strip()[:40]
+        files: list[dict] = []
+        for f in cad_raw.get("files", []) or []:
+            if not isinstance(f, dict) or len(files) >= 50:
+                continue
+            file_entry: dict[str, Any] = {}
+            name = f.get("name")
+            if isinstance(name, str) and name.strip():
+                file_entry["name"] = name.strip()[:200]
+            content = f.get("content")
+            if isinstance(content, str) and content.strip():
+                file_entry["content"] = content[:500_000]
+            if file_entry:
+                files.append(file_entry)
+        if files:
+            cad["files"] = files
+        if cad:
+            out["cad"] = cad
+
+    justification = parsed.get("justification")
+    if isinstance(justification, str) and justification.strip():
+        out["justification"] = justification.strip()[:20_000]
+
+    # Contract requires at least one BOM line to be scoreable
+    return out if "bom" in out else None
+
+
+def run_drone_sample(runner: Any, sample: dict) -> dict:
+    """Run one drone-build sample through the agentic oracle loop.
+
+    Returns the raw runner result enriched with the parsed output contract
+    (``output_parsed``), oracle tool-call bookkeeping and the sample id.
+    Scoring is NOT done here — the parsed output must be sent to the
+    deterministic backend scorer (POST /scoring/drone-build).
+    """
+    oracle = DroneOracle(sample)
+
+    tool_specs = oracle.get_tool_specs(provider=runner.provider)
+    callers = oracle.get_tool_callers()
+
+    def handle_call(name: str, args: dict):
+        if name not in callers:
+            return {"error": f"Unknown tool: {name}"}
+        return callers[name](args)
+
+    result = runner.run_oracle_sample(
+        DRONE_USER_PROMPT,
+        tool_specs,
+        handle_call,
+        system=DRONE_SYSTEM_PROMPT,
+    )
+
+    parsed = parse_final_json(result.get("output", ""))
+    result["output_parsed"] = parsed if isinstance(parsed, dict) else None
+    result["oracle_calls"] = len(result.get("tool_calls", []))
+    result["sample_id"] = sample.get("id", sample.get("sample_id", ""))
+    return result

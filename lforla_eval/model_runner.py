@@ -13,6 +13,35 @@ from typing import Any
 
 import httpx
 
+
+def _post_with_retry(client: httpx.Client, url: str, *, json: dict, headers: dict,
+                     attempts: int = 8) -> httpx.Response:
+    """POST with exponential backoff on 429/5xx and error-bodied 200s
+    (free-tier gateways sometimes answer HTTP 200 with {"error": ...})."""
+    delay = 8.0
+
+    def _body_has_error(resp: httpx.Response) -> bool:
+        try:
+            body = resp.json()
+        except Exception:
+            return False
+        return isinstance(body, dict) and bool(body.get("error"))
+
+    for attempt in range(attempts):
+        r = client.post(url, json=json, headers=headers)
+        if r.status_code == 200 and not _body_has_error(r):
+            return r
+        retryable = (
+            r.status_code in (429, 500, 502, 503, 504)
+            or (r.status_code == 200 and _body_has_error(r))
+        )
+        if retryable and attempt < attempts - 1:
+            time.sleep(delay)
+            delay = min(delay * 1.7, 60.0)
+            continue
+        r.raise_for_status()
+    return r
+
 # Optional per-1000-token pricing (USD) for cost-per-task metrics.
 # Common pricing map for known model families (USD per 1K tokens).
 # Overridable via LFORLA_PRICE_PER_1K_IN / LFORLA_PRICE_PER_1K_OUT env vars;
@@ -60,6 +89,12 @@ class ModelRunner:
         self.model_id = model_id
         self.provider = provider
         self.api_key = api_key or os.getenv(f"{provider.upper()}_API_KEY") or ""
+        # Completion budget per call. Benchmarks with large structured outputs
+        # (drone-build CAD sources) need far more than the old 2048 default.
+        try:
+            self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+        except ValueError:
+            self.max_tokens = 8192
 
     def estimate_cost_usd(self, tokens_input: int, tokens_output: int) -> float | None:
         """Estimate cost in USD for a call using the pricing table.
@@ -158,10 +193,21 @@ class ModelRunner:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        runner = self._oracle_loop_openai if self.provider == "openai" else \
-            (self._oracle_loop_anthropic if self.provider == "anthropic" else self._oracle_loop_generic)
+        # Native OpenAI-style tool-calling for the generic provider too
+        # (opencode Zen and most gateways support it). Opt out with
+        # LLM_NATIVE_TOOLS=0 for endpoints without tools support — the
+        # text-based "TOOL:" protocol is used as fallback.
+        native_generic = (
+            self.provider == "generic" and os.getenv("LLM_NATIVE_TOOLS", "1") != "0"
+        )
+        if self.provider == "anthropic":
+            runner_loop = self._oracle_loop_anthropic
+        elif self.provider == "openai" or native_generic:
+            runner_loop = self._oracle_loop_openai
+        else:
+            runner_loop = self._oracle_loop_generic
 
-        content, tool_calls, usage_in, usage_out = runner(
+        content, tool_calls, usage_in, usage_out = runner_loop(
             messages, tool_specs, handle_call, max_iterations
         )
         elapsed = int((time.time() - start) * 1000)
@@ -177,14 +223,22 @@ class ModelRunner:
     def _chat_openai(
         self, messages: list[dict], tools: list[dict] | None = None
     ) -> dict:
-        client = httpx.Client(base_url="https://api.openai.com/v1", timeout=120)
+        # provider == "generic" reuses the native OpenAI tool-calling loop
+        # against any OpenAI-compatible endpoint (LLM_ENDPOINT base URL).
+        base_url = (
+            "https://api.openai.com/v1"
+            if self.provider == "openai"
+            else os.getenv("LLM_ENDPOINT", "").rstrip("/")
+        )
+        if not base_url:
+            raise RuntimeError("LLM_ENDPOINT environment variable required for generic provider")
+        client = httpx.Client(base_url=base_url, timeout=httpx.Timeout(900.0, connect=30.0))
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        body: dict = {"model": self.model_id, "messages": messages, "max_tokens": 2048}
+        body: dict = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
-        r = client.post("/chat/completions", json=body, headers=headers)
-        r.raise_for_status()
+        r = _post_with_retry(client, "/chat/completions", json=body, headers=headers)
         return r.json()
 
     def _oracle_loop_openai(self, messages, tool_specs, handle_call, max_iterations):
@@ -245,7 +299,7 @@ class ModelRunner:
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
-        body: dict = {"model": self.model_id, "max_tokens": 2048, "messages": messages}
+        body: dict = {"model": self.model_id, "max_tokens": self.max_tokens, "messages": messages}
         if tools:
             body["tools"] = tools
         r = client.post("/messages", json=body, headers=headers)
@@ -371,9 +425,8 @@ class ModelRunner:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        body = {"model": self.model_id, "messages": messages, "max_tokens": 2048}
-        r = client.post("/chat/completions", json=body, headers=headers)
-        r.raise_for_status()
+        body = {"model": self.model_id, "messages": messages, "max_tokens": self.max_tokens}
+        r = _post_with_retry(client, "/chat/completions", json=body, headers=headers)
         data = r.json()
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {})
@@ -413,10 +466,9 @@ class ModelRunner:
         body = {
             "model": self.model_id,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,
+            "max_tokens": self.max_tokens,
         }
-        r = client.post("/chat/completions", json=body, headers=headers)
-        r.raise_for_status()
+        r = _post_with_retry(client, "/chat/completions", json=body, headers=headers)
         data = r.json()
         elapsed = int((time.time() - start) * 1000)
         choice = data["choices"][0]
@@ -438,7 +490,7 @@ class ModelRunner:
         }
         body = {
             "model": self.model_id,
-            "max_tokens": 2048,
+            "max_tokens": self.max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
         r = client.post("/messages", json=body, headers=headers)
@@ -494,10 +546,9 @@ class ModelRunner:
         body = {
             "model": self.model_id,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2048,
+            "max_tokens": self.max_tokens,
         }
-        r = client.post("/chat/completions", json=body, headers=headers)
-        r.raise_for_status()
+        r = _post_with_retry(client, "/chat/completions", json=body, headers=headers)
         data = r.json()
         elapsed = int((time.time() - start) * 1000)
         return {
