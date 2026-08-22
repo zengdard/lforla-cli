@@ -337,6 +337,12 @@ def run(
 ):
     """Run a benchmark locally by calling an LLM API."""
     path = Path(input_file)
+    if not path.exists() and input_file in ("politiscales", "politiscales-bias"):
+        from .politiscales import pull_questionnaire
+
+        input_file = pull_questionnaire()
+        path = Path(input_file)
+        rprint(f"[cyan]Pulled politiscales dataset from LFORLA → {input_file}[/cyan]")
     if not path.exists():
         rprint(f"[red]Error:[/red] File not found: {input_file}")
         raise typer.Exit(1)
@@ -369,6 +375,26 @@ def run(
 
     runner = ModelRunner(model_id=model, provider=provider)
 
+    # PolitiScales questionnaire: rows are survey statements, not samples.
+    if samples and isinstance(samples[0], dict) and "weightsYes" in samples[0]:
+        from .politiscales import run_politiscales
+
+        rprint(f"[bold]PolitiScales survey:[/bold] {len(samples)} statements")
+        result = run_politiscales(model, input_file)
+        output_data = {
+            "benchmark_id": benchmark_id,
+            "model": model,
+            "provider": provider,
+            "total_samples": 1,
+            "results": [result],
+        }
+        Path(output).write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
+        rprint(
+            f"[green]✓[/green] PolitiScales done: compliance {result['overall_score']}%, "
+            f"{int(result['execution_time_ms']) / 1000:.0f}s"
+        )
+        return output_data
+
     results = []
     total = len(samples)
     with console.status(f"Running {total} samples...") as status:
@@ -379,6 +405,12 @@ def run(
                 result = run_sample_any(runner, sample)
                 result["sample_id"] = sample_id
                 results.append(result)
+                rprint(
+                    f"[{i + 1}/{total}] [green]✓[/green] {sample_id}: "
+                    f"score {result.get('score', '?')} "
+                    f"({result.get('oracle_calls', 0)} oracle calls, "
+                    f"{int(result.get('execution_time_ms', 0)) / 1000:.0f}s)"
+                )
             except Exception as e:
                 rprint(f"\n[red]✗[/red] Sample {sample_id} failed: {e}")
                 results.append({"sample_id": sample_id, "error": str(e)})
@@ -672,8 +704,6 @@ def push(
         "benchmark_id": bid,
         "model_id": model_id or data.get("model_id", ""),
         "overall_score": round(avg_score, 2),
-        "total_tokens": total_tokens or None,
-        "total_cost_usd": round(total_cost_usd, 6) if total_cost_usd > 0 else None,
         "metrics": {
             "avg_latency_ms": round(avg_latency, 2),
             "total_tokens": total_tokens,
@@ -682,6 +712,12 @@ def push(
         },
         "visibility": visibility,
     }
+    if total_tokens:
+        payload["total_tokens"] = total_tokens
+    if total_cost_usd > 0:
+        payload["total_cost_usd"] = round(total_cost_usd, 6)
+    if total_ms > 0:
+        payload["latency_ms"] = int(total_ms / len(scores)) if scores else 0
 
     resp = client.post("/evaluations", payload)
     eval_id = resp.get("id", resp.get("evaluation_id", "unknown"))

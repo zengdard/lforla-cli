@@ -656,6 +656,12 @@ def run_drone_sample(runner: Any, sample: dict) -> dict:
         tool_specs,
         handle_call,
         system=DRONE_SYSTEM_PROMPT,
+        max_iterations=24,
+        nudge_prompt=(
+            "You have gathered enough information. Stop calling tools and return ONLY the "
+            "final STRICT JSON object with keys architecture, bom, total_cost_usd, analysis, "
+            "cad, justification — no prose, no markdown fences."
+        ),
     )
 
     parsed = parse_final_json(result.get("output", ""))

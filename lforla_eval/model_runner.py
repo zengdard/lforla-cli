@@ -15,10 +15,10 @@ import httpx
 
 
 def _post_with_retry(client: httpx.Client, url: str, *, json: dict, headers: dict,
-                     attempts: int = 8) -> httpx.Response:
+                     attempts: int = 10) -> httpx.Response:
     """POST with exponential backoff on 429/5xx and error-bodied 200s
     (free-tier gateways sometimes answer HTTP 200 with {"error": ...})."""
-    delay = 8.0
+    delay = 10.0
 
     def _body_has_error(resp: httpx.Response) -> bool:
         try:
@@ -37,7 +37,7 @@ def _post_with_retry(client: httpx.Client, url: str, *, json: dict, headers: dic
         )
         if retryable and attempt < attempts - 1:
             time.sleep(delay)
-            delay = min(delay * 1.7, 60.0)
+            delay = min(delay * 1.7, 90.0)
             continue
         r.raise_for_status()
     return r
@@ -155,12 +155,17 @@ class ModelRunner:
         *,
         max_iterations: int = 12,
         system: str | None = None,
+        nudge_prompt: str | None = None,
     ) -> dict:
         """Run an agentic loop where the model may call oracle tools.
 
         ``tool_specs`` is the provider-specific tool list.
         ``handle_call(name, args)`` is invoked for every tool call and its
         return value is fed back to the model.
+
+        When the loop exhausts ``max_iterations`` without a final answer and
+        ``nudge_prompt`` is set, one last tool-less call is made with that
+        prompt appended so exploration-heavy models still emit their answer.
 
         Returns the same shape as ``run_sample`` (``output``, token counts,
         latency) plus ``tool_calls`` and ``iterations``.
@@ -208,7 +213,7 @@ class ModelRunner:
             runner_loop = self._oracle_loop_generic
 
         content, tool_calls, usage_in, usage_out = runner_loop(
-            messages, tool_specs, handle_call, max_iterations
+            messages, tool_specs, handle_call, max_iterations, nudge_prompt
         )
         elapsed = int((time.time() - start) * 1000)
         return self._attach_cost({
@@ -241,7 +246,7 @@ class ModelRunner:
         r = _post_with_retry(client, "/chat/completions", json=body, headers=headers)
         return r.json()
 
-    def _oracle_loop_openai(self, messages, tool_specs, handle_call, max_iterations):
+    def _oracle_loop_openai(self, messages, tool_specs, handle_call, max_iterations, nudge_prompt=None):
         tool_calls_log = []
         total_in = 0
         total_out = 0
@@ -290,6 +295,16 @@ class ModelRunner:
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
+        if not final_content.strip() and tool_calls_log and nudge_prompt:
+            # Exploration exhausted the iteration budget without a final
+            # answer — one last tool-less call to force the JSON out.
+            messages.append({"role": "user", "content": nudge_prompt})
+            data = self._chat_openai(messages)
+            msg = data["choices"][0]["message"]
+            usage = data.get("usage", {})
+            total_in += usage.get("prompt_tokens", 0)
+            total_out += usage.get("completion_tokens", 0)
+            final_content = msg.get("content", "") or ""
         return final_content, tool_calls_log, total_in, total_out
 
     def _chat_anthropic(self, messages, tools=None) -> dict:
@@ -306,7 +321,7 @@ class ModelRunner:
         r.raise_for_status()
         return r.json()
 
-    def _oracle_loop_anthropic(self, messages, tool_specs, handle_call, max_iterations):
+    def _oracle_loop_anthropic(self, messages, tool_specs, handle_call, max_iterations, nudge_prompt=None):
         tool_calls_log = []
         total_in = 0
         total_out = 0
@@ -347,7 +362,7 @@ class ModelRunner:
             messages.append({"role": "user", "content": tool_results})
         return final_content, tool_calls_log, total_in, total_out
 
-    def _oracle_loop_generic(self, messages, tool_specs, handle_call, max_iterations):
+    def _oracle_loop_generic(self, messages, tool_specs, handle_call, max_iterations, nudge_prompt=None):
         """Fallback for providers without native tool-calling (ollama/generic).
 
         Injects the available tools into the system prompt and instructs the
