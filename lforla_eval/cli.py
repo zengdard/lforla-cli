@@ -306,6 +306,39 @@ def run_sample_any(runner: ModelRunner, sample: dict) -> dict:
             if any(str(c.get("id")) == str(cid) for c in oracle.candidates)
         ]
 
+    # Enrich chosen candidates with their full profile for the TeamArena view.
+    by_id = {str(c.get("id")): c for c in oracle.candidates}
+    members = []
+    for cid in team:
+        cand = by_id.get(str(cid.get("id")))
+        if cand:
+            members.append({k: cand.get(k) for k in
+                ("id", "name", "role", "seniority", "years_experience",
+                 "expected_salary", "skills", "strengths", "weaknesses", "kind")})
+
+    # Capture the model's justification from its final JSON answer.
+    justification = ""
+    try:
+        decoded = parse_final_json(output)
+        if isinstance(decoded, dict):
+            justification = decoded.get("justification") or ""
+    except Exception:
+        justification = ""
+
+    result["raw_outputs"] = {
+        "type": "team",
+        "context": {
+            "num_seats": oracle_cfg.get("num_seats"),
+            "total_budget": oracle_cfg.get("total_budget"),
+        },
+        "roles": [
+            {"role": r.get("role"), "critical": bool(r.get("critical"))}
+            for r in oracle_cfg.get("role_needs", [])
+        ],
+        "team": members,
+        "justification": justification,
+    }
+
     scoring = score_team(team, oracle, include_debug=True)
     result["score"] = scoring["overall_score"]
     result["overall_score"] = scoring["overall_score"]
@@ -687,6 +720,15 @@ def push(
     total_ms = sum(s.get("execution_time_ms", 0) for s in scores)
     avg_latency = total_ms / len(scores) if scores else 0
 
+    # Free/zen runs report no real price. Estimate a nominal cost from tokens
+    # so the cost-per-token and cost-per-task charts stay populated. The rate
+    # (USD / token, blended in+out) is a convention, flagged as an estimate.
+    ESTIMATED_TOKEN_RATE = 0.0000005  # $0.50 per 1M tokens (blended)
+    estimated = False
+    if total_cost_usd <= 0 and total_tokens > 0:
+        total_cost_usd = round(total_tokens * ESTIMATED_TOKEN_RATE, 6)
+        estimated = True
+
     metric_names = [
         "role_coverage", "skill_match", "budget", "seat_limit",
         "seniority_balance", "meets_min_seniority",
@@ -728,6 +770,7 @@ def push(
             "avg_latency_ms": round(avg_latency, 2),
             "total_tokens": total_tokens,
             "sample_count": len(scores),
+            "estimated_cost": estimated,
             **oracle_metrics,
         },
         "visibility": visibility,
@@ -738,6 +781,12 @@ def push(
         payload["total_cost_usd"] = round(total_cost_usd, 6)
     if total_ms > 0:
         payload["latency_ms"] = int(total_ms / len(scores)) if scores else 0
+
+    # Collect per-sample proposed outputs (e.g. recruitment teams) into a
+    # single raw_outputs object so the benchmark-specific view can render it.
+    ro_list = [s.get("raw_outputs") for s in scores if isinstance(s.get("raw_outputs"), dict)]
+    if ro_list:
+        payload["raw_outputs"] = ro_list if len(ro_list) > 1 else ro_list[0]
 
     resp = client.post("/evaluations", payload)
     eval_id = resp.get("id", resp.get("evaluation_id", "unknown"))
