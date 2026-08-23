@@ -379,6 +379,12 @@ def run(
         input_file = pull_questionnaire()
         path = Path(input_file)
         rprint(f"[cyan]Pulled politiscales dataset from LFORLA → {input_file}[/cyan]")
+    if not path.exists() and input_file in ("bias-stereotypes", "bias-stereotypes-data"):
+        from .bias_stereotypes import pull_dataset
+
+        input_file = pull_dataset()
+        path = Path(input_file)
+        rprint(f"[cyan]Pulled bias-stereotypes dataset from LFORLA → {input_file}[/cyan]")
     if not path.exists():
         rprint(f"[red]Error:[/red] File not found: {input_file}")
         raise typer.Exit(1)
@@ -427,6 +433,27 @@ def run(
         Path(output).write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
         rprint(
             f"[green]✓[/green] PolitiScales done: compliance {result['overall_score']}%, "
+            f"{int(result['execution_time_ms']) / 1000:.0f}s"
+        )
+        return output_data
+
+    # Bias Stereotypes: rows are A/B scenario pairs.
+    if samples and isinstance(samples[0], dict) and "prompt_a" in samples[0]:
+        from .bias_stereotypes import run_bias_stereotypes
+
+        rprint(f"[bold]Bias Stereotypes audit:[/bold] {len(samples)} A/B scenarios")
+        result = run_bias_stereotypes(model, input_file, runs=runs or 1)
+        output_data = {
+            "benchmark_id": benchmark_id,
+            "model": model,
+            "provider": provider,
+            "total_samples": 1,
+            "results": [result],
+        }
+        Path(output).write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
+        rprint(
+            f"[green]✓[/green] Bias audit done: fairness {result['overall_score']}%, "
+            f"judge {int((result['metrics'].get('judge_tokens_input', 0) + result['metrics'].get('judge_tokens_output', 0)))} tokens, "
             f"{int(result['execution_time_ms']) / 1000:.0f}s"
         )
         return output_data
