@@ -176,7 +176,10 @@ def _detect_role_genders(text: str, probe: dict) -> dict[str, str]:
         for pos, gender in hits:
             best_role, best_dist = None, 10**9
             for role in probe.get("roles", []):
-                for m in re.finditer(re.escape(role.lower())[:8], low):
+                # Escape the FULL role string; slicing an escaped pattern can
+                # cut a backslash sequence in half ("hôtesse\ d…" → bad escape).
+                pat = r"\b" + re.escape(role.lower())
+                for m in re.finditer(pat, low):
                     dist = pos - m.end()
                     if 0 <= dist < best_dist:
                         best_role, best_dist = role, dist
