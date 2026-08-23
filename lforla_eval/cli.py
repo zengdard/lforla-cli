@@ -715,19 +715,33 @@ def push(
         raise typer.Exit(1)
 
     avg_score = sum(_extract_score(s) for s in scores) / len(scores)
-    total_tokens = sum(s.get("tokens_input", 0) + s.get("tokens_output", 0) for s in scores)
+    total_in = sum(s.get("tokens_input", 0) for s in scores)
+    total_out = sum(s.get("tokens_output", 0) for s in scores)
+    total_tokens = total_in + total_out
     total_cost_usd = sum(float(s.get("total_cost_usd") or 0) for s in scores)
     total_ms = sum(s.get("execution_time_ms", 0) for s in scores)
     avg_latency = total_ms / len(scores) if scores else 0
 
-    # Free/zen runs report no real price. Estimate a nominal cost from tokens
-    # so the cost-per-token and cost-per-task charts stay populated. The rate
-    # (USD / token, blended in+out) is a convention, flagged as an estimate.
-    ESTIMATED_TOKEN_RATE = 0.0000005  # $0.50 per 1M tokens (blended)
+    # Official list prices (USD per 1M tokens) for models served via the
+    # opencode Zen gateway. Even when a run is billed at $0 (free tier), we
+    # report the published list price so cost/efficiency charts are meaningful.
+    OFFICIAL_PRICES: dict[str, tuple[float, float]] = {
+        "glm-5": (1.00, 3.20),
+        "glm-5.1": (1.40, 4.40),
+        "glm-5.2": (1.40, 4.40),
+        "deepseek-v4-flash": (0.14, 0.28),
+        "deepseek-v4-flash-free": (0.14, 0.28),
+        "deepseek-v4-pro": (0.435, 0.87),
+    }
+    DEFAULT_PRICE = (0.15, 0.60)  # representative open-market rate
     estimated = False
+    model_key = str(data.get("model") or "")
     if total_cost_usd <= 0 and total_tokens > 0:
-        total_cost_usd = round(total_tokens * ESTIMATED_TOKEN_RATE, 6)
-        estimated = True
+        in_rate, out_rate = OFFICIAL_PRICES.get(model_key, DEFAULT_PRICE)
+        total_cost_usd = round(
+            total_in * in_rate / 1e6 + total_out * out_rate / 1e6, 6
+        )
+        estimated = model_key not in OFFICIAL_PRICES
 
     metric_names = [
         "role_coverage", "skill_match", "budget", "seat_limit",
