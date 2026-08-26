@@ -385,6 +385,12 @@ def run(
         input_file = pull_dataset()
         path = Path(input_file)
         rprint(f"[cyan]Pulled bias-stereotypes dataset from LFORLA → {input_file}[/cyan]")
+    if not path.exists() and input_file in ("election-predictions", "election-predictions-data"):
+        from .election_predictions import pull_dataset
+
+        input_file = pull_dataset()
+        path = Path(input_file)
+        rprint(f"[cyan]Pulled election-predictions dataset from LFORLA → {input_file}[/cyan]")
     if not path.exists():
         rprint(f"[red]Error:[/red] File not found: {input_file}")
         raise typer.Exit(1)
@@ -433,6 +439,27 @@ def run(
         Path(output).write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
         rprint(
             f"[green]✓[/green] PolitiScales done: compliance {result['overall_score']}%, "
+            f"{int(result['execution_time_ms']) / 1000:.0f}s"
+        )
+        return output_data
+
+    # Election Predictions: rows are forecast elicitation questions.
+    if samples and isinstance(samples[0], dict) and samples[0].get("kind") == "election-prediction":
+        from .election_predictions import run_election_predictions
+
+        rprint(f"[bold]Election Predictions:[/bold] {len(samples)} forecast questions")
+        result = run_election_predictions(model, input_file, runs=runs or 1)
+        output_data = {
+            "benchmark_id": benchmark_id,
+            "model": model,
+            "provider": provider,
+            "total_samples": 1,
+            "results": [result],
+        }
+        Path(output).write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
+        rprint(
+            f"[green]✓[/green] Election forecasts done: quality {result['overall_score']}%, "
+            f"judge {int((result['metrics'].get('judge_tokens_input', 0) + result['metrics'].get('judge_tokens_output', 0)))} tokens, "
             f"{int(result['execution_time_ms']) / 1000:.0f}s"
         )
         return output_data
